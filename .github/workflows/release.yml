@@ -1,0 +1,335 @@
+# Release build for Windows (x86-64), Linux (x86-64 and arm64) and an Android build check: the prebuilt
+# runtime, the tools and the first-start setup, published as one GitHub Release. Adapted from
+# ZeldaWWHDRecomp's release workflow (MPL-2.0).
+#
+# Legal: CI never has the game. The runtime is compiled and linked against placeholder guest code
+# (tools/recomp/stubgen.py); the real game code is generated and compiled on the player's machine by the
+# setup, from the player's own dump. tools/release/guard.py fails the job if the package contains game
+# code, game files, saves or key-like strings.
+#
+# Android: the APK can only hold game code built from the player's own game, so releases never contain
+# one. The android job builds the app with placeholder code only to check that it compiles (README,
+# "Android").
+#
+# Triggers: pushing a tag v* builds and publishes a release. "Run workflow" builds and checks the
+# packages and keeps them as workflow artifacts.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SDL3_URL: https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz
+  SDL3_SHA256: 9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
+  VULKAN_HEADERS_URL: https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.363.tar.gz
+  VULKAN_HEADERS_SHA256: cbaf687d3c59b9666fe080e7f8396b6b4f4d344a768ee6b337c59852f4526b68
+  VULKAN_DEF_URL: https://raw.githubusercontent.com/KhronosGroup/Vulkan-Loader/vulkan-sdk-1.4.363.0/loader/vulkan-1.def
+  VULKAN_DEF_SHA256: 9ba339b7f5ee2df28487698a6840ecf095fac58b415c2c89ad9f161e9d316378
+
+jobs:
+  windows:
+    name: windows-x86_64
+    runs-on: windows-latest
+    env:
+      TOOLCHAIN: llvm-mingw-20260922
+      TRIPLE: x86_64-w64-mingw32
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF#refs/tags/}"; else V="$(git describe --tags --always)"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "version $V"
+
+      - name: Pinned llvm-mingw toolchain (tools/installer/toolchains.json)
+        run: |
+          read -r URL SUM DIR < <(python -c "
+          import json, os; t=json.load(open('tools/installer/toolchains.json'))['toolchains'][os.environ['TOOLCHAIN']]
+          print(t['url'], t['sha256'], t['dir'])" | tr -d '\r')
+          T="$(cygpath -m "$RUNNER_TEMP")"
+          curl -fsSL -o "$T/llvm-mingw.zip" "$URL"
+          echo "$SUM  $T/llvm-mingw.zip" | sha256sum -c -
+          unzip -q "$T/llvm-mingw.zip" -d "$T"
+          echo "LLVM_MINGW=$T/$DIR" >> "$GITHUB_ENV"
+          echo "$T/$DIR/bin" >> "$GITHUB_PATH"
+          pip install ninja
+
+      - name: Vulkan headers and import library
+        run: |
+          T="$(cygpath -m "$RUNNER_TEMP")"
+          curl -fsSL -o vh.tar.gz "$VULKAN_HEADERS_URL"
+          echo "$VULKAN_HEADERS_SHA256  vh.tar.gz" | sha256sum -c -
+          mkdir -p "$T/vulkan" && tar -xzf vh.tar.gz -C "$T/vulkan" --strip-components=1
+          curl -fsSL -o vulkan-1.def "$VULKAN_DEF_URL"
+          echo "$VULKAN_DEF_SHA256  vulkan-1.def" | sha256sum -c -
+          "$LLVM_MINGW/bin/llvm-dlltool.exe" -m i386:x86-64 -d vulkan-1.def -l "$T/vulkan/libvulkan-1.a"
+          echo "VULKAN_DIR=$T/vulkan" >> "$GITHUB_ENV"
+
+      - name: Build the runtime (Release, Vulkan + SDL3) against placeholder guest code
+        run: |
+          python tools/recomp/stubgen.py build/gen-stub
+          cmake -S . -B build/rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DWWHD_VERSION="$VERSION" \
+            -DGEN_DIR="$(cygpath -m "$PWD/build/gen-stub")" \
+            -DCMAKE_C_COMPILER="$LLVM_MINGW/bin/$TRIPLE-clang.exe" \
+            -DCMAKE_CXX_COMPILER="$LLVM_MINGW/bin/$TRIPLE-clang++.exe" \
+            -DCMAKE_RC_COMPILER="$LLVM_MINGW/bin/$TRIPLE-windres.exe" \
+            -DCMAKE_EXE_LINKER_FLAGS=-static -DWWHD_BUNDLED_DEPS=ON -DWWHD_SETUP_GUI=ON \
+            -DVulkan_INCLUDE_DIR="$VULKAN_DIR/include" -DVulkan_LIBRARY="$VULKAN_DIR/libvulkan-1.a"
+          # what the package needs: the game's runtime, the setup / launcher and the extractor
+          ninja -C build/rel -d keeprsp wwhd wwhd-setup wwhd-extract
+
+      - name: "Unit tests (informative, the tests come from the macOS port)"
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          ninja -C build/rel -k 0
+          ctest --test-dir build/rel --output-on-failure --timeout 600
+          python tools/installer/test_setup.py
+
+      - name: Pinned embeddable Python, shipped in the release (tools/installer/toolchains.json)
+        run: |
+          read -r URL SUM < <(python -c "
+          import json; p=json.load(open('tools/installer/toolchains.json'))['python']['windows']
+          print(p['url'], p['sha256'])" | tr -d '\r')
+          T="$(cygpath -m "$RUNNER_TEMP")"
+          curl -fsSL -o "$T/python-embed.zip" "$URL"
+          echo "$SUM  $T/python-embed.zip" | sha256sum -c -
+          echo "WIN_PY_ZIP=$T/python-embed.zip" >> "$GITHUB_ENV"
+
+      - name: Package
+        run: |
+          W="$(cygpath -m "$PWD")"
+          python tools/release/package.py --build build/rel --platform windows-x86_64 --version "$VERSION" \
+            --out dist --toolchain "$TOOLCHAIN" --setup-gui build/rel/wwhd-setup.exe \
+            --windows-python "$WIN_PY_ZIP" \
+            --runtime-file build/rel/SDL3.dll \
+            --license "SDL3 (zlib)=$W/build/rel/_deps/sdl3-src/LICENSE.txt" \
+            --license "Vulkan-Headers (Apache-2.0)=$VULKAN_DIR/LICENSE.md" \
+            --license "glslang (BSD-3-Clause and others)=$W/build/rel/_deps/glslang-src/LICENSE.txt" \
+            --license "zlib (zlib)=$W/build/rel/_deps/zlib-src/LICENSE" \
+            --license "LZ4 (BSD-2-Clause)=$W/build/rel/_deps/lz4-src/lib/LICENSE" \
+            --license "LLVM libc++ (Apache-2.0 WITH LLVM-exception)=$LLVM_MINGW/LICENSE.TXT"
+
+      - name: Guard (no game code, game files or keys)
+        run: python tools/release/guard.py dist/*.zip
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  linux:
+    # x86-64 and arm64 (aarch64), each built on its own architecture's runner. glibc 2.35: the oldest base
+    # the release supports (Ubuntu 22.04, Debian 12, Fedora 36, SteamOS 3, Raspberry Pi OS 12 64-bit).
+    # GitHub's arm64 Linux runners are free for public repositories only: a private repository builds
+    # x86-64 alone.
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(github.event.repository.private && '[{"arch":"x86_64","runner":"ubuntu-22.04","toolchain":"zig-0.16.0"}]' || '[{"arch":"x86_64","runner":"ubuntu-22.04","toolchain":"zig-0.16.0"},{"arch":"aarch64","runner":"ubuntu-22.04-arm","toolchain":"zig-0.16.0-aarch64"}]') }}
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      ARCH: ${{ matrix.arch }}
+      TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF#refs/tags/}"; else V="$(git describe --tags --always)"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "version $V"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # SDL3's documented Linux build dependencies, so the shipped SDL3 has every backend (X11,
+          # Wayland, PipeWire/PulseAudio/ALSA, input, IME); libvulkan1 is only linked against (players
+          # use their own Vulkan loader)
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config xz-utils file libvulkan1 \
+            libasound2-dev libpulse-dev libaudio-dev libfribidi-dev libjack-dev libsndio-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
+            libxtst-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev libthai-dev libusb-1.0-0-dev \
+            libpipewire-0.3-dev libwayland-dev libdecor-0-dev liburing-dev wayland-protocols
+
+      - name: Pinned zig toolchain (tools/installer/toolchains.json)
+        run: |
+          read -r URL SUM DIR TARGET < <(python3 -c "
+          import json, os; t=json.load(open('tools/installer/toolchains.json'))['toolchains'][os.environ['TOOLCHAIN']]
+          print(t['url'], t['sha256'], t['dir'], t['target'])")
+          echo "ZIG_DIR=$RUNNER_TEMP/$DIR" >> "$GITHUB_ENV"
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" "$URL"
+          echo "$SUM  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          ZIG="$RUNNER_TEMP/$DIR/zig"
+          mkdir -p "$RUNNER_TEMP/zbin"
+          printf '#!/bin/sh\nexec "%s" cc -target %s "$@"\n' "$ZIG" "$TARGET" > "$RUNNER_TEMP/zbin/zcc"
+          printf '#!/bin/sh\nexec "%s" c++ -target %s "$@"\n' "$ZIG" "$TARGET" > "$RUNNER_TEMP/zbin/zcxx"
+          printf '#!/bin/sh\nexec "%s" ar "$@"\n' "$ZIG" > "$RUNNER_TEMP/zbin/zar"
+          printf '#!/bin/sh\nexec "%s" ranlib "$@"\n' "$ZIG" > "$RUNNER_TEMP/zbin/zranlib"
+          chmod +x "$RUNNER_TEMP"/zbin/*
+          echo "ZBIN=$RUNNER_TEMP/zbin" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-cache" >> "$GITHUB_ENV"
+
+      - name: SDL3 (shared library, system compiler, shipped next to the game)
+        run: |
+          curl -fsSL -o sdl3.tar.gz "$SDL3_URL"
+          echo "$SDL3_SHA256  sdl3.tar.gz" | sha256sum -c -
+          tar -xzf sdl3.tar.gz
+          cmake -S SDL3-3.4.18 -B sdl3-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX="$HOME/sdl3"
+          cmake --build sdl3-build
+          cmake --install sdl3-build
+
+      - name: Vulkan headers
+        run: |
+          curl -fsSL -o vh.tar.gz "$VULKAN_HEADERS_URL"
+          echo "$VULKAN_HEADERS_SHA256  vh.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/vulkan" && tar -xzf vh.tar.gz -C "$HOME/vulkan" --strip-components=1
+
+      - name: Build the runtime (Release, Vulkan + SDL3) with zig against placeholder guest code
+        run: |
+          python3 tools/recomp/stubgen.py build/gen-stub
+          cmake -S . -B build/rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DWWHD_VERSION="$VERSION" -DGEN_DIR="$PWD/build/gen-stub" \
+            -DCMAKE_C_COMPILER="$ZBIN/zcc" -DCMAKE_CXX_COMPILER="$ZBIN/zcxx" \
+            -DCMAKE_AR="$ZBIN/zar" -DCMAKE_RANLIB="$ZBIN/zranlib" \
+            -DWWHD_BUNDLED_DEPS=ON -DCMAKE_PREFIX_PATH="$HOME/sdl3" -DWWHD_SETUP_GUI=ON \
+            -DVulkan_INCLUDE_DIR="$HOME/vulkan/include" \
+            -DVulkan_LIBRARY="/usr/lib/$ARCH-linux-gnu/libvulkan.so.1"
+          cmake --build build/rel
+
+      - name: Unit tests
+        timeout-minutes: 30
+        run: |
+          export LD_LIBRARY_PATH="$HOME/sdl3/lib"
+          ctest --test-dir build/rel --output-on-failure --timeout 600
+          python3 tools/installer/test_setup.py
+
+      - name: Package
+        run: |
+          python3 tools/release/package.py --build build/rel --platform "linux-$ARCH" --version "$VERSION" \
+            --out dist --toolchain "$TOOLCHAIN" --setup-gui build/rel/wwhd-setup \
+            --runtime-file "$HOME/sdl3/lib/libSDL3.so.0" \
+            --linkonly-lib "/usr/lib/$ARCH-linux-gnu/libvulkan.so.1" \
+            --license "SDL3 (zlib)=$PWD/SDL3-3.4.18/LICENSE.txt" \
+            --license "Vulkan-Headers (Apache-2.0)=$HOME/vulkan/LICENSE.md" \
+            --license "glslang (BSD-3-Clause and others)=$PWD/build/rel/_deps/glslang-src/LICENSE.txt" \
+            --license "zlib (zlib)=$PWD/build/rel/_deps/zlib-src/LICENSE" \
+            --license "LZ4 (BSD-2-Clause)=$PWD/build/rel/_deps/lz4-src/lib/LICENSE" \
+            --license "LLVM libc++ (Apache-2.0 WITH LLVM-exception)=$ZIG_DIR/lib/libcxx/LICENSE.TXT"
+
+      - name: Guard (no game code, game files or keys)
+        run: python3 tools/release/guard.py dist/*.zip
+
+      - name: Installer self-test (unzipped release, placeholder code, toolchain download)
+        run: |
+          mkdir -p "$RUNNER_TEMP/unz" && cd "$RUNNER_TEMP/unz" && unzip -q "$GITHUB_WORKSPACE"/dist/*.zip
+          cd TwilightPrincessHD-*
+          ./tools/setup-in-terminal.sh --yes --no-launch --gen-dir "$GITHUB_WORKSPACE/build/gen-stub" --data-dir "$RUNNER_TEMP/data"
+          want=$([ "$ARCH" = aarch64 ] && echo "ARM aarch64" || echo "x86-64")
+          file "$RUNNER_TEMP/data/bin/wwhd" ./twilight-princess-hd
+          file "$RUNNER_TEMP/data/bin/wwhd" | grep -q "$want"
+          file ./twilight-princess-hd | grep -q "$want"
+          ldd "$RUNNER_TEMP/data/bin/wwhd"
+          ldd ./twilight-princess-hd
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  android:
+    # The app (android/) with placeholder game code: checks that the native library and the APK build.
+    # The APK is never a release asset (it cannot run the game, and one built from a real game must not
+    # be shared); it is kept a few days for inspection only.
+    name: android-arm64 (build check)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      NDK_VERSION: 30.0.16248370
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Validate the Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Install the NDK and SDK packages
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Native library (placeholder game code)
+        run: |
+          python3 tools/recomp/stubgen.py build/gen-stub
+          GEN_DIR="$PWD/build/gen-stub" ANDROID_SDK="$ANDROID_HOME" JOBS=4 android/build_native.sh
+
+      - name: APK
+        working-directory: android
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Legal check of the APK
+        run: python3 tools/release/guard.py android/app/build/outputs/apk/release/*.apk
+
+      - name: Keep the APK for a few days (placeholder code, not a release)
+        uses: actions/upload-artifact@v5
+        with:
+          name: tphd-android-placeholder-${{ github.sha }}
+          path: android/app/build/outputs/apk/release/*.apk
+          retention-days: 3
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, linux, android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Guard all packages again
+        run: python3 tools/release/guard.py dist/*.zip
+
+      - name: Checksums and release notes
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          (cd dist && sha256sum *.zip > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          python3 tools/release/notes.py CHANGELOG.md "$VERSION" dist/SHA256SUMS.txt > dist/notes.md
+          cat dist/notes.md
+
+      - name: Publish the release
+        run: |
+          gh release create "$VERSION" dist/*.zip dist/SHA256SUMS.txt --verify-tag --prerelease \
+            --title "Twilight Princess HD for Windows, Linux & Android $VERSION" --notes-file dist/notes.md

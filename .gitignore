@@ -1,0 +1,56 @@
+# game data (copyrighted, user-supplied); no trailing slash, so a symlinked game/ is ignored too
+/game
+game.wux
+game.key
+*.rpx
+# upstream reference checkout
+/cemu/
+# generated / build output
+/build/
+out/
+__pycache__/
+filelist.txt
+extract.log
+.DS_Store
+/ref/
+trace_dump.txt
+/save/
+compile_commands.json
+.cache/
+frame_*.png
+failed_shader_*.metal
+shaders/
+draw_*.png
+captures/
+# never commit game data, keys or anything derived from the game
+*.key
+*.wud
+*.wux
+*.iso
+*.rvz
+template.bin
+shaderprep_template.bin
+headstart.bin
+# GameCube decompilation (zeldaret/tww), reference only
+/tww/
+# logs and dumps (may contain game text or imagery)
+*.log
+*.metal
+*.tsv
+# local coordination board
+/task.md
+# local diagnostics of this port
+tphd_tex/
+tphd_shot_*.png
+tphd_shots.on
+# Android: your own native libraries (they contain your game code), SDL's copied Java files, builds
+/android/app/libs/
+/android/app/sdl-java/
+/android/app/local-res/
+/android/app/build/
+/android/build/
+/android/.gradle/
+/android/local.properties
+*.apk
+*.aab
+/dist/

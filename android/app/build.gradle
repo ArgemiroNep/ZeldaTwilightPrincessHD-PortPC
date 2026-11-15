@@ -1,0 +1,47 @@
+// The native libraries are built by android/build_native.sh into app/libs/<abi> (libmain.so is the
+// recompiled game: build it from your own game, and keep the APK to yourself), and SDL's Java files
+// into app/sdl-java. Adapted from ZeldaWWHDRecomp's Android app (MPL-2.0).
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace = "io.github.argemironep.tphd"
+    compileSdk 36
+    buildToolsVersion "35.0.0"  // pinned (CI installs this one)
+    ndkVersion "30.0.16248370"  // android/build_native.sh's default (the native libraries come from there)
+    defaultConfig {
+        applicationId "io.github.argemironep.tphd"
+        minSdk 33
+        targetSdk 36
+        versionCode providers.gradleProperty('tphdVersionCode').map { it as int }.getOrElse(1)
+        versionName providers.gradleProperty('tphdVersionName').getOrElse('0.1.0')
+        ndk { abiFilters providers.gradleProperty('tphdAbi').getOrElse('arm64-v8a') }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false  // no R8: SDL looks its Java classes and methods up by name
+            // your own build: signed with your local debug key, so it installs on your own phone
+            signingConfig signingConfigs.debug
+        }
+    }
+    sourceSets.main.jniLibs.srcDirs = ['libs']
+    sourceSets.main.java.srcDirs += ['sdl-java']
+    // the game's own icon (android/make_icon.py, from your game files; git-ignored), else the app icon
+    def gameIcon = file('local-res').exists()
+    if (gameIcon) sourceSets.main.res.srcDirs += ['local-res']
+    defaultConfig.manifestPlaceholders = [appIcon: gameIcon ? '@mipmap/ic_game' : '@mipmap/ic_launcher']
+    packaging {
+        jniLibs {
+            keepDebugSymbols += ['**/libmain.so']  // stripped by build_native.sh already
+        }
+    }
+    lint { abortOnError = false }
+}
+
+tasks.matching { it.name == 'preBuild' }.configureEach {
+    doFirst {
+        if (!file('sdl-java/org/libsdl/app/SDLActivity.java').exists())
+            throw new GradleException('Run android/build_native.sh first (it builds libmain.so and copies SDL\'s Java files)')
+    }
+}
